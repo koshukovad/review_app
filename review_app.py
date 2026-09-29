@@ -367,7 +367,8 @@ def merge_and_deduplicate_reviews(
             subset=["review_id"],
             keep="first"
         )
-                duplicates_after_merge = before_final_dedup - len(result_df)
+
+        duplicates_after_merge = before_final_dedup - len(result_df)
 
         added = len(only_new_df)
 
@@ -388,44 +389,53 @@ def merge_and_deduplicate_reviews(
 
 
 # ============================================================
-# Сохранение CSV и Excel
+# Сохранение файлов
 # ============================================================
 
-def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    """Готовит CSV в памяти с BOM, чтобы Excel понимал UTF-8 и кириллицу."""
-    csv_text = df.to_csv(
+def save_reviews_to_csv_and_xlsx(
+    df: pd.DataFrame,
+    csv_path: str,
+    xlsx_path: str
+) -> Tuple[bool, Optional[str]]:
+    """
+    CSV формируется всегда.
+    Excel формируется при доступном openpyxl.
+
+    CSV использует utf-8-sig, чтобы Excel Windows правильно
+    показывал кириллицу, китайский текст и другие символы.
+    """
+    df.to_csv(
+        csv_path,
         index=False,
         quoting=csv.QUOTE_ALL,
+        encoding="utf-8-sig",
         lineterminator="\n"
     )
 
-    return csv_text.encode("utf-8-sig")
-
-
-def dataframe_to_excel_bytes(
-    df: pd.DataFrame
-) -> Tuple[Optional[bytes], Optional[str]]:
-    """Готовит Excel-файл в памяти, не записывая его на сервер."""
     try:
-        from io import BytesIO
+        import openpyxl  # noqa: F401
 
-        buffer = BytesIO()
+        df.to_excel(
+            xlsx_path,
+            index=False,
+            engine="openpyxl"
+        )
 
-        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            df.to_excel(
-                writer,
-                index=False,
-                sheet_name="Reviews"
-            )
-
-        return buffer.getvalue(), None
+        return True, None
 
     except Exception as exc:
-        return None, f"{type(exc).__name__}: {exc}"
+        # Не даём скачать старый Excel, если новый создать не удалось.
+        if os.path.exists(xlsx_path):
+            try:
+                os.remove(xlsx_path)
+            except OSError:
+                pass
+
+        return False, f"{type(exc).__name__}: {exc}"
 
 
 # ============================================================
-# Основной сбор отзывов
+# Основной сбор
 # ============================================================
 
 def collect_reviews_for_app(
@@ -433,19 +443,43 @@ def collect_reviews_for_app(
     progress_bar,
     status_text,
     results_placeholder
-) -> Tuple[pd.DataFrame, int, int, int]:
+) -> Tuple[
+    pd.DataFrame,
+    int,
+    int,
+    int,
+    int,
+    int,
+    int,
+    str,
+    str,
+    bool,
+    Optional[str]
+]:
     """
-    Собирает максимум 30 отзывов на каждую страну.
+    Собирает до 30 отзывов по каждой стране.
 
     Возвращает:
     - итоговый DataFrame;
-    - количество стран с отзывами;
+    - количество успешно обработанных стран;
     - количество пропущенных стран;
-    - число найденных отзывов.
+    - всего найдено отзывов в текущем запуске;
+    - добавлено новых отзывов;
+    - количество дублей;
+    - всего строк в итоговом CSV;
+    - имя CSV;
+    - имя Excel;
+    - флаг создания Excel;
+    - текст ошибки Excel, если есть.
     """
+    csv_filename = f"app_store_reviews_{app_id}.csv"
+    xlsx_filename = f"app_store_reviews_{app_id}.xlsx"
+
     session = requests.Session()
 
-    all_reviews: List[Dict[str, Any]] = []
+    existing_df = load_existing_csv(csv_filename)
+
+    all_new_reviews: List[Dict[str, Any]] = []
 
     countries_ok = 0
     countries_error = 0
@@ -456,10 +490,11 @@ def collect_reviews_for_app(
     progress_bar.progress(0)
 
     for index, country in enumerate(COUNTRY_CODES, start=1):
-        status_text.info(
-            f"Обработка страны {country}: {index}/{total_countries}"
+        status_text.text(
+            f"Обработка страны: {country} ({index}/{total_countries})"
         )
 
+        # Достаточно одной страницы: далее оставляем максимум 30.
         data, error = fetch_reviews_page(
             app_id=app_id,
             country=country,
@@ -472,12 +507,11 @@ def collect_reviews_for_app(
 
             log_lines.append(
                 f"[{index}/{total_countries}] {country}: "
-                f"пропущено — {error or 'нет данных'}"
+                "пропущено (ошибка, приложение недоступно или отзывов нет)"
             )
 
             results_placeholder.code("\n".join(log_lines))
             progress_bar.progress(index / total_countries)
-
             time.sleep(PAUSE_BETWEEN_REQUESTS)
             continue
 
@@ -492,27 +526,27 @@ def collect_reviews_for_app(
 
             log_lines.append(
                 f"[{index}/{total_countries}] {country}: "
-                "отзывы не найдены"
+                "пропущено (Apple не вернул отзывы)"
             )
 
             results_placeholder.code("\n".join(log_lines))
             progress_bar.progress(index / total_countries)
-
             time.sleep(PAUSE_BETWEEN_REQUESTS)
             continue
 
-        # В RSS используется sortBy=mostRecent — первые отзывы самые новые.
+        # Apple сортирует RSS по mostRecent, поэтому первые 30 — самые новые.
         country_reviews = country_reviews[:MAX_REVIEWS_PER_COUNTRY]
 
         for review in country_reviews:
             review["review_id"] = compute_review_id(review)
 
-        all_reviews.extend(country_reviews)
+        all_new_reviews.extend(country_reviews)
+
         countries_ok += 1
 
         log_lines.append(
             f"[{index}/{total_countries}] {country}: "
-            f"найдено — {len(country_reviews)}"
+            f"найдено отзывов — {len(country_reviews)}"
         )
 
         results_placeholder.code("\n".join(log_lines))
@@ -520,29 +554,50 @@ def collect_reviews_for_app(
 
         time.sleep(PAUSE_BETWEEN_REQUESTS)
 
-    result_df = pd.DataFrame(
-        all_reviews,
-        columns=REQUIRED_COLUMNS
-    )
+    if not all_new_reviews:
+        if existing_df is not None:
+            result_df = existing_df.copy()
+        else:
+            result_df = pd.DataFrame(columns=REQUIRED_COLUMNS)
 
-    if not result_df.empty:
-        result_df = result_df.fillna("").astype(str)
-
-        result_df = result_df.drop_duplicates(
-            subset=["review_id"],
-            keep="first"
+        return (
+            result_df,
+            countries_ok,
+            countries_error,
+            0,
+            0,
+            0,
+            len(result_df),
+            csv_filename,
+            xlsx_filename,
+            False,
+            None
         )
 
-        result_df["_sort_date"] = result_df["date"].apply(safe_to_datetime)
+    merged_df, added, duplicates = merge_and_deduplicate_reviews(
+        existing_df=existing_df,
+        new_reviews=all_new_reviews
+    )
 
-        result_df = result_df.sort_values(
-            by="_sort_date",
-            ascending=False
-        ).drop(columns="_sort_date")
+    excel_created, excel_error = save_reviews_to_csv_and_xlsx(
+        df=merged_df,
+        csv_path=csv_filename,
+        xlsx_path=xlsx_filename
+    )
 
-        result_df = result_df.reset_index(drop=True)
-
-    return result_df, countries_ok, countries_error, len(all_reviews)
+    return (
+        merged_df,
+        countries_ok,
+        countries_error,
+        len(all_new_reviews),
+        added,
+        duplicates,
+        len(merged_df),
+        csv_filename,
+        xlsx_filename,
+        excel_created,
+        excel_error
+    )
 
 
 # ============================================================
@@ -550,7 +605,7 @@ def collect_reviews_for_app(
 # ============================================================
 
 st.set_page_config(
-    page_title="Отзывы Apple App Store",
+    page_title="App Store Reviews Collector",
     page_icon="📱",
     layout="wide"
 )
@@ -558,14 +613,14 @@ st.set_page_config(
 st.title("📱 Сбор отзывов Apple App Store")
 
 st.write(
-    "Введите числовой ID приложения. Сервис соберёт до 30 последних "
-    "отзывов для каждой страны: Россия, Франция, Германия, "
-    "Великобритания, США, Китай и Индия."
+    "Введите числовой ID приложения. Будут собраны до **30 последних отзывов** "
+    "для каждой страны: Россия, Франция, Германия, Великобритания, США, "
+    "Китай и Индия."
 )
 
 st.caption(
-    "Источник данных: публичный Apple RSS JSON. "
-    "App Store Connect API, ключи и авторизация не используются."
+    "Данные получаются из публичного RSS/JSON Apple без авторизации, "
+    "API-ключей и App Store Connect API."
 )
 
 app_id = st.text_input(
@@ -583,6 +638,8 @@ if st.button("Начать сбор отзывов", type="primary"):
         st.error(f"Ошибка: {error_message}")
 
     else:
+        st.success(f"Начинаем сбор отзывов для app_id: {app_id}")
+
         progress_bar = st.progress(0)
         status_text = st.empty()
         results_placeholder = st.empty()
@@ -591,7 +648,14 @@ if st.button("Начать сбор отзывов", type="primary"):
             result_df,
             countries_ok,
             countries_error,
-            total_found
+            total_found,
+            added,
+            duplicates,
+            final_rows,
+            output_csv,
+            output_xlsx,
+            excel_created,
+            excel_error
         ) = collect_reviews_for_app(
             app_id=app_id,
             progress_bar=progress_bar,
@@ -600,25 +664,49 @@ if st.button("Начать сбор отзывов", type="primary"):
         )
 
         progress_bar.progress(1.0)
-        status_text.success("Сбор завершён.")
+        status_text.text("Сбор завершён.")
+
+        if total_found == 0:
+            st.warning(
+                "Новые отзывы не найдены. Возможно, приложение недоступно "
+                "в выбранных странах или Apple временно не вернул отзывы."
+            )
+        else:
+            st.success("Отзывы собраны, отображены в таблице и сохранены в файлы.")
 
         st.subheader("Итоги")
 
-        metric_1, metric_2, metric_3 = st.columns(3)
+        metric_col_1, metric_col_2, metric_col_3 = st.columns(3)
 
-        metric_1.metric("Стран с отзывами", countries_ok)
-        metric_2.metric("Стран пропущено", countries_error)
-        metric_3.metric("Всего найдено отзывов", total_found)
+        metric_col_1.metric("Успешно обработано стран", countries_ok)
+        metric_col_2.metric("Пропущено стран", countries_error)
+        metric_col_3.metric("Найдено в текущем запуске", total_found)
 
+        metric_col_1.metric("Добавлено новых", added)
+        metric_col_2.metric("Пропущено дубликатов", duplicates)
+        metric_col_3.metric("Всего строк в результате", final_rows)
+
+        st.write(f"ID приложения: `{app_id}`")
+        st.write(f"CSV-файл: `{output_csv}`")
+
+        if excel_created:
+            st.write(f"Excel-файл: `{output_xlsx}`")
+        elif excel_error:
+            st.warning(
+                "CSV создан успешно, но Excel-файл создать не удалось. "
+                f"Причина: {excel_error}"
+            )
+
+        # ----------------------------------------------------
+        # Таблица прямо в интерфейсе
+        # ----------------------------------------------------
         st.subheader("Отзывы")
 
         if result_df.empty:
-            st.warning(
-                "Отзывы не найдены. Проверьте ID приложения "
-                "или попробуйте выполнить сбор позже."
-            )
-
+            st.info("Таблица пуста: отзывов для отображения нет.")
         else:
+            # Технический review_id не показываем в основной таблице,
+            # но он сохраняется в скачиваемых CSV и Excel.
             display_columns = [
                 "country",
                 "rating",
@@ -626,11 +714,17 @@ if st.button("Начать сбор отзывов", type="primary"):
                 "content",
                 "author",
                 "date",
-                "version"
+                "version",
+                "app_id",
+                "collected_at"
             ]
 
+            table_df = result_df[
+                [column for column in display_columns if column in result_df.columns]
+            ].copy()
+
             st.dataframe(
-                result_df[display_columns],
+                table_df,
                 use_container_width=True,
                 hide_index=True,
                 column_config={
@@ -655,53 +749,62 @@ if st.button("Начать сбор отзывов", type="primary"):
                         width="medium"
                     ),
                     "date": st.column_config.TextColumn(
-                        "Дата",
+                        "Дата отзыва",
                         width="medium"
                     ),
                     "version": st.column_config.TextColumn(
                         "Версия",
                         width="small"
+                    ),
+                    "app_id": st.column_config.TextColumn(
+                        "ID приложения",
+                        width="medium"
+                    ),
+                    "collected_at": st.column_config.TextColumn(
+                        "Загружено",
+                        width="medium"
                     )
                 }
             )
 
-            st.subheader("Скачать результат")
+        # ----------------------------------------------------
+        # Кнопки скачивания
+        # ----------------------------------------------------
+        st.subheader("Скачать результат")
 
-            csv_bytes = dataframe_to_csv_bytes(result_df)
+        download_col_1, download_col_2 = st.columns(2)
 
-            download_1, download_2 = st.columns(2)
+        if os.path.exists(output_csv):
+            with open(output_csv, "rb") as csv_file:
+                csv_bytes = csv_file.read()
 
-            download_1.download_button(
+            download_col_1.download_button(
                 label="Скачать CSV",
                 data=csv_bytes,
-                file_name=f"app_store_reviews_{app_id}.csv",
+                file_name=output_csv,
                 mime="text/csv",
                 use_container_width=True
             )
 
-            excel_bytes, excel_error = dataframe_to_excel_bytes(result_df)
+        if excel_created and os.path.exists(output_xlsx):
+            with open(output_xlsx, "rb") as xlsx_file:
+                xlsx_bytes = xlsx_file.read()
 
-            if excel_bytes is not None:
-                download_2.download_button(
-                    label="Скачать Excel",
-                    data=excel_bytes,
-                    file_name=f"app_store_reviews_{app_id}.xlsx",
-                    mime=(
-                        "application/vnd.openxmlformats-officedocument"
-                        ".spreadsheetml.sheet"
-                    ),
-                    use_container_width=True
-                )
-            else:
-                st.warning(
-                    "CSV доступен, но Excel не удалось сформировать. "
-                    f"Причина: {excel_error}"
-                )
+            download_col_2.download_button(
+                label="Скачать Excel",
+                data=xlsx_bytes,
+                file_name=output_xlsx,
+                mime=(
+                    "application/vnd.openxmlformats-officedocument"
+                    ".spreadsheetml.sheet"
+                ),
+                use_container_width=True
+            )
 
 st.divider()
 
 st.caption(
-    "Публичный Apple RSS не гарантирует полную историю отзывов. "
-    "Доступность приложения и количество отзывов могут отличаться "
-    "в разных странах."
+    "Apple RSS выдаёт отзывы отдельно для каждого storefront. Один app_id "
+    "используется во всех странах, но доступность приложения и число отзывов "
+    "могут отличаться. Публичный RSS Apple не гарантирует полный архив отзывов."
 )
